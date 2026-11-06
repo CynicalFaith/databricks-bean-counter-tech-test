@@ -7,7 +7,7 @@
 # MAGIC
 # MAGIC ### Assumptions
 # MAGIC 1. **Late arrival is simulated.** The config cell writes every file at once, so I move `customers_batch2.json` and the 2 and 3 March order files into a `_holding` folder, run the pipeline (**Run 1**), move them into landing (**Run 2**), then run again with no new files (**Run 3**) to prove the pipeline is idempotent.
-# MAGIC 2. **Bronze stays raw.** Every source column lands as a string, plus `_source_file`, `_ingested_at` and Auto Loader's `_rescued_data`. All typing happens in silver, so a malformed value can never fail ingestion.
+# MAGIC 2. **Bronze stays raw.** Every source column lands as a string, plus `_source_file` and `_ingested_at` (and Auto Loader's `_rescued_data` for orders). All typing happens in silver, so a malformed value can never fail ingestion.
 # MAGIC 3. **The generator writes Python `None` as the literal text `"None"`** (`",".join(map(str, r))`). So for `customer_id`, `NULL`, `""`, whitespace and `"None"` all count as *missing*.
 # MAGIC 4. **Exact duplicates** means identical on all 7 business columns. The lineage columns differ per row and are ignored. Once exact duplicates are gone, `order_id` is unique, so it serves as the merge key into silver.
 # MAGIC 5. **Dedup runs before quarantine.** A duplicated bad row is quarantined once. The spec's two rejection rules (`quantity <= 0`, missing `customer_id`) are applied. I also quarantine rows whose quantity or timestamp can't be parsed, or whose price is still missing after the product lookup, so silver only holds rows that are safe to aggregate. A row can carry several reasons (`;`-separated).
@@ -142,47 +142,49 @@ print("customers landing:", [f.name for f in dbutils.fs.ls(f"{base}/customers")]
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Bronze: Auto Loader ingestion
-# MAGIC * **Only new files are processed on rerun.** Auto Loader tracks every ingested file in its checkpoint, and `trigger(availableNow=True)` runs it as an incremental batch: it processes whatever is new, then stops.
+# MAGIC ## 2. Bronze: incremental ingestion (Auto Loader for orders, COPY INTO for customers)
+# MAGIC * **Only new files are processed on rerun.** Auto Loader tracks ingested files in its checkpoint, and `trigger(availableNow=True)` runs it as an incremental batch: it processes whatever is new, then stops. `COPY INTO` keeps the list of loaded files in the target table's metadata and skips them on rerun (it is idempotent).
 # MAGIC * **Lineage:** `_source_file` comes from `_metadata.file_path` and `_ingested_at` from `current_timestamp()`.
-# MAGIC * **Schema drift:** `cloudFiles.schemaEvolutionMode = addNewColumns` and `mergeSchema = true`. When Auto Loader first sees `marketing_opt_in`, it records the new column in its schema location and deliberately stops the stream (`UnknownFieldException`). The documented pattern is to restart, and `run_autoloader` does that automatically (bounded retries). The stream then carries on with the wider schema and earlier rows get `NULL`. Values that don't fit the schema would go to `_rescued_data` rather than being lost.
+# MAGIC * **Schema drift (`marketing_opt_in`).** I tried Auto Loader for customers first, but with `addNewColumns` it *deliberately stops the stream* when it sees a new column, and expects a restart. Even with an automatic retry, Databricks marks the notebook command as failed ("Some streams terminated…"), so the pipeline effectively breaks. For the drifting JSON source I therefore use **`COPY INTO` with `mergeSchema`** in both the format and copy options. The new column is added to `bronze_customers` in place, earlier rows get `NULL`, and nothing stops. Orders (a stable CSV contract) stay on Auto Loader, with `_rescued_data` catching anything unexpected.
+# MAGIC * Bronze keeps every value as a string (`inferColumnTypes=false` / `primitivesAsString=true`). All typing happens in silver.
 
 # COMMAND ----------
 
-def run_autoloader(source_dir, fmt, target, extra_opts=None, max_restarts=3):
-    """Incrementally load new files from source_dir into a bronze Delta table.
-    Restarts on schema evolution: Auto Loader stops once when it sees a new column."""
+def run_autoloader(source_dir, fmt, target, extra_opts=None):
+    """Incrementally load only new files from source_dir into a bronze Delta table (Auto Loader)."""
     name = target.split(".")[-1]
-    for attempt in range(max_restarts + 1):
-        reader = (spark.readStream.format("cloudFiles")
-                  .option("cloudFiles.format", fmt)
-                  .option("cloudFiles.schemaLocation", f"{state}/schemas/{name}")
-                  .option("cloudFiles.schemaEvolutionMode", "addNewColumns")
-                  .option("cloudFiles.inferColumnTypes", "false"))      # bronze = raw strings
-        for k, v in (extra_opts or {}).items():
-            reader = reader.option(k, v)
-        df = (reader.load(source_dir)
-              .withColumn("_source_file", F.col("_metadata.file_path"))
-              .withColumn("_ingested_at", F.current_timestamp()))
-        q = (df.writeStream
-             .option("checkpointLocation", f"{state}/checkpoints/{name}")
-             .option("mergeSchema", "true")
-             .trigger(availableNow=True)
-             .toTable(target))
-        try:
-            q.awaitTermination()
-            return
-        except Exception as e:
-            if "UnknownFieldException" in str(e) or "UNKNOWN_FIELD_EXCEPTION" in str(e):
-                print(f"[{name}] new column detected -> schema updated, restarting stream (attempt {attempt + 1})")
-                continue
-            raise
-    raise RuntimeError(f"{name}: exceeded {max_restarts} schema-evolution restarts")
+    reader = (spark.readStream.format("cloudFiles")
+              .option("cloudFiles.format", fmt)
+              .option("cloudFiles.schemaLocation", f"{state}/schemas/{name}")
+              .option("cloudFiles.inferColumnTypes", "false"))          # bronze = raw strings
+    for k, v in (extra_opts or {}).items():
+        reader = reader.option(k, v)
+    (reader.load(source_dir)
+        .withColumn("_source_file", F.col("_metadata.file_path"))
+        .withColumn("_ingested_at", F.current_timestamp())
+        .writeStream
+        .option("checkpointLocation", f"{state}/checkpoints/{name}")
+        .trigger(availableNow=True)
+        .toTable(target)
+        .awaitTermination())
+
+
+def run_copy_into(source_dir, fmt, target):
+    """Idempotent, schema-evolving load of only new files (COPY INTO)."""
+    spark.sql(f"CREATE TABLE IF NOT EXISTS {target}")      # schemaless placeholder; COPY INTO sets the schema
+    res = spark.sql(f"""
+        COPY INTO {target}
+        FROM (SELECT *, _metadata.file_path AS _source_file, current_timestamp() AS _ingested_at
+              FROM '{source_dir}')
+        FILEFORMAT = {fmt}
+        FORMAT_OPTIONS ('mergeSchema' = 'true', 'primitivesAsString' = 'true')
+        COPY_OPTIONS ('mergeSchema' = 'true')""").first()
+    print(f"[{target.split('.')[-1]}] COPY INTO inserted {res['num_inserted_rows']} rows")
 
 
 def run_bronze():
     run_autoloader(f"{base}/orders", "csv", fq("bronze_orders"), {"header": "true"})
-    run_autoloader(f"{base}/customers", "json", fq("bronze_customers"))
+    run_copy_into(f"{base}/customers", "JSON", fq("bronze_customers"))
 
 # COMMAND ----------
 
@@ -262,7 +264,7 @@ def transform_orders(bronze_df):
 
 
 def upsert_orders(batch_df, batch_id):
-    df = transform_orders(batch_df).cache()
+    df = transform_orders(batch_df)   # no .cache(): not supported on serverless
 
     good = df.filter("rejection_reason IS NULL").select(
         "order_id", F.trim("customer_id").alias("customer_id"), "store_id", "product_id",
@@ -279,7 +281,6 @@ def upsert_orders(batch_df, batch_id):
     (DeltaTable.forName(spark, fq("silver_orders_quarantine")).alias("t")
         .merge(bad.alias("s"), "t.row_hash = s.row_hash")
         .whenNotMatchedInsertAll().execute())
-    df.unpersist()
 
 # COMMAND ----------
 
@@ -386,7 +387,7 @@ run_pipeline("Run 1 - initial landing files")
 
 # MAGIC %md
 # MAGIC ### Run 2: late files arrive (2 and 3 March orders, customers batch 2 with the new `marketing_opt_in` column)
-# MAGIC Expect one automatic restart of the customers bronze stream when the new column is detected.
+# MAGIC `COPY INTO` picks up only the new files and adds `marketing_opt_in` to `bronze_customers` without stopping.
 
 # COMMAND ----------
 
@@ -510,8 +511,8 @@ run_pipeline("Run 3 - rerun, nothing new")
 
 # MAGIC %md
 # MAGIC ## 8. Notes and what I'd do next
-# MAGIC * **Auto Loader vs COPY INTO.** I chose Auto Loader because it scales to millions of files (it can switch to file-notification mode) and has schema inference, evolution and rescued data built in. COPY INTO would also have met the "only new files" requirement, and its `mergeSchema` copy option avoids the restart on a new column.
-# MAGIC * **Productionising.** I'd split this into bronze, silver and gold tasks in a Lakeflow Job, or port it to Lakeflow Declarative Pipelines, where `expect_or_drop` would replace the hand-rolled quarantine and Auto CDC (`APPLY CHANGES`, SCD1, sequenced by `updated_at`) would replace the customer MERGE. Jobs retry automatically, which also covers the schema-evolution restart.
-# MAGIC * **Data quality to raise with the business.** Roughly a third of orders lack a customer (the generator picks `""` or `None` one time in three), and about 2 in 7 have quantity ≤ 0. I'd want to know whether negative quantities are refunds that belong in revenue, rather than errors.
+# MAGIC * **Auto Loader vs COPY INTO.** Auto Loader scales to millions of files (it can switch to file-notification mode) and rescues bad data, so it is my default for high-volume feeds like orders. `COPY INTO` suits low-volume, schema-drifting batches like the customers extracts: it evolves the schema in place, without the stop-and-restart Auto Loader needs. In a scheduled Job with retries, Auto Loader `addNewColumns` would also be fine for customers.
+# MAGIC * **Productionising.** I'd split this into bronze, silver and gold tasks in a Lakeflow Job, or port it to Lakeflow Declarative Pipelines, where `expect_or_drop` would replace the hand-rolled quarantine and Auto CDC (`APPLY CHANGES`, SCD1, sequenced by `updated_at`) would replace the customer MERGE. Jobs retry automatically, which covers Auto Loader's schema-evolution restart.
+# MAGIC * **Data quality to raise with the business.** About two thirds of orders lack a customer (the generator picks `""` or `None` two times in three), and about 2 in 7 have quantity ≤ 0. I'd want to know whether negative quantities are refunds that belong in revenue, rather than errors.
 # MAGIC * **Gold at scale.** I'd compute it incrementally (MERGE only the affected dates and stores) or as materialized views, instead of a full rebuild.
 # MAGIC * **Tests.** I'd add unit tests for `transform_orders` with a small fixture DataFrame covering each rejection rule and both timestamp formats.
